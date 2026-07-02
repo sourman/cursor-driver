@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""
+cursor-openai-toggle — flip Cursor's "useOpenAIKey" switch.
+
+DEFAULT (live): drives the REAL handler over CDP via the hook we patched into
+  Cursor's Glass bundle (workbench.glass.main.js exposes the reactive-storage
+  service as globalThis.__cursorRS). Calls:
+      __cursorRS.setApplicationUserPersistentStorage("useOpenAIKey", bool)
+  → updates the in-memory store AND persists to state.vscdb, through Cursor's
+  own code. No click, no restart, no clobbering. Requires Cursor running with
+  --remote-debugging-port=9223 (see ~/.local/share/applications/cursor.desktop)
+  AND the patch applied (globalThis.__cursorRS present).
+
+  cursor-openai-toggle            # live toggle (default)
+  cursor-openai-toggle --on       # live ON
+  cursor-openai-toggle --off      # live OFF
+  cursor-openai-toggle --status   # live + disk value, read-only
+
+DISK fallback (--disk): edits state.vscdb directly. Only sticks if Cursor is
+  QUIT (the renderer's in-memory copy clobbers it otherwise).
+  cursor-openai-toggle --disk [--on|--off]   # edit disk
+  cursor-openai-toggle --restore FILE        # restore a saved backup blob
+"""
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+
+CDP = os.path.expanduser("~/.local/bin/cursor-cdp")
+DB = os.path.expanduser("~/.config/Cursor/User/globalStorage/state.vscdb")
+BLOB_KEY = (
+    "src.vs.platform.reactivestorage.browser."
+    "reactiveStorageServiceImpl.persistentStorage.applicationUser"
+)
+
+
+def die(msg, code=1):
+    print(f"cursor-openai-toggle: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# --------------------------------------------------------------- live (CDP)
+
+def cdp_eval(js):
+    """Run a JS expression via cursor-cdp eval-file; return parsed JSON value."""
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+        f.write(js)
+        path = f.name
+    try:
+        r = subprocess.run([CDP, "eval-file", path], capture_output=True, text=True, timeout=30)
+    finally:
+        os.unlink(path)
+    if r.returncode != 0:
+        die("CDP call failed (is Cursor running with --remote-debugging-port=9223 and the "
+            f"patch applied?)\n  {r.stderr.strip() or r.stdout.strip()}")
+    out = r.stdout.strip().splitlines()
+    # last non-empty line is the value (cursor-cdp may print nothing else to stdout)
+    val = out[-1] if out else ""
+    try:
+        return json.loads(val)
+    except json.JSONDecodeError:
+        die(f"unexpected CDP output (not JSON): {val!r}")
+
+
+_LIVE_PROLOG = "const rs=globalThis.__cursorRS;"
+_LIVE_GUARD = "if(!rs)return JSON.stringify({error:'__cursorRS hook not present — patch workbench.glass.main.js'});"
+
+
+def live_read():
+    return cdp_eval(
+        "(()=>{" + _LIVE_PROLOG + _LIVE_GUARD +
+        "return JSON.stringify({useOpenAIKey:rs.applicationUserPersistentStorage.useOpenAIKey,"
+        "openAIBaseUrl:rs.applicationUserPersistentStorage.openAIBaseUrl});})()"
+    )
+
+
+def live_set(target):
+    """target: 'toggle' | 'on' | 'off'"""
+    expr = {
+        "toggle": "!rs.applicationUserPersistentStorage.useOpenAIKey",
+        "on": "true",
+        "off": "false",
+    }[target]
+    return cdp_eval(
+        "(()=>{" + _LIVE_PROLOG + _LIVE_GUARD +
+        "const b=rs.applicationUserPersistentStorage.useOpenAIKey;"
+        f"rs.setApplicationUserPersistentStorage('useOpenAIKey',{expr});"
+        "return JSON.stringify({before:b,after:rs.applicationUserPersistentStorage.useOpenAIKey});})()"
+    )
+
+
+# --------------------------------------------------------------- disk (offline)
+
+def _decode(raw):
+    return raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw
+
+
+def disk_read():
+    if not os.path.exists(DB):
+        return None
+    con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=10)
+    row = con.execute("SELECT value FROM ItemTable WHERE key=?", (BLOB_KEY,)).fetchone()
+    con.close()
+    return json.loads(_decode(row[0])).get("useOpenAIKey") if row else None
+
+
+def disk_write(want):
+    blob = _disk_read_raw()
+    if blob is None:
+        die(f"blob key not found: {BLOB_KEY}")
+    as_bytes = True
+    matches = list(re.finditer(r'("useOpenAIKey"\s*:\s*)(true|false)', blob))
+    if len(matches) != 1:
+        die(f"expected exactly one useOpenAIKey field, found {len(matches)}")
+    m = matches[0]
+    old = m.group(2)
+    new = "true" if want else "false"
+    if old == new:
+        print(f"disk already {new} — nothing to do."); return
+    bak = f"{DB}.useOpenAIKey.bak-{time.strftime('%Y%m%d-%H%M%S')}.json"
+    with open(bak, "wb") as f:
+        f.write(blob.encode("utf-8") if isinstance(blob, str) else blob)
+    print(f"backup -> {bak}")
+    new_raw = blob[: m.start(2)] + new + blob[m.end(2):]
+    payload = new_raw.encode("utf-8") if as_bytes else new_raw
+    con = sqlite3.connect(f"file:{DB}?mode=rwc", uri=True, timeout=15)
+    con.execute("PRAGMA busy_timeout=15000")
+    con.execute("UPDATE ItemTable SET value=? WHERE key=?", (payload, BLOB_KEY))
+    con.commit(); con.execute("PRAGMA wal_checkpoint(TRUNCATE)"); con.commit(); con.close()
+    print(f"disk useOpenAIKey: {old} -> {new}")
+
+
+def _disk_read_raw():
+    if not os.path.exists(DB):
+        return None
+    con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=10)
+    row = con.execute("SELECT value FROM ItemTable WHERE key=?", (BLOB_KEY,)).fetchone()
+    con.close()
+    return _decode(row[0]) if row else None
+
+
+# --------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(prog="cursor-openai-toggle",
+                                 description="Toggle Cursor's useOpenAIKey (live via CDP, or --disk).")
+    mx = ap.add_mutually_exclusive_group()
+    mx.add_argument("--toggle", action="store_true", help="flip (default)")
+    mx.add_argument("--on", action="store_true", help="set ON")
+    mx.add_argument("--off", action="store_true", help="set OFF")
+    mx.add_argument("--status", action="store_true", help="read-only; print state")
+    mx.add_argument("--restore", metavar="FILE", help="restore a saved backup blob (disk)")
+    ap.add_argument("--disk", action="store_true",
+                    help="edit state.vscdb directly (only sticks if Cursor is QUIT)")
+    args = ap.parse_args()
+
+    # --- restore (disk) ---
+    if args.restore:
+        if not os.path.exists(args.restore):
+            die(f"backup not found: {args.restore}")
+        with open(args.restore, "rb") as f:
+            data = f.read()
+        con = sqlite3.connect(f"file:{DB}?mode=rwc", uri=True, timeout=15)
+        con.execute("UPDATE ItemTable SET value=? WHERE key=?", (data, BLOB_KEY))
+        con.commit(); con.close()
+        print(f"restored {BLOB_KEY} from {args.restore}")
+        return
+
+    # --- decide target ---
+    if args.on:
+        target = "on"
+    elif args.off:
+        target = "off"
+    else:
+        target = "toggle"
+
+    # --- disk mode ---
+    if args.disk:
+        want = {"on": True, "off": False, "toggle": "toggle"}[target]
+        if want == "toggle":
+            cur = disk_read()
+            want = not bool(cur)
+        disk_write(want)
+        return
+
+    # --- live mode (default) ---
+    if args.status:
+        live = live_read()
+        disk = disk_read()
+        if "error" in live:
+            die(live["error"])
+        print(f"live  useOpenAIKey: {live['useOpenAIKey']}    ({'ON' if live['useOpenAIKey'] else 'OFF'})")
+        print(f"disk  useOpenAIKey: {disk}    ({'ON' if disk else 'OFF'})")
+        print(f"openAIBaseUrl    : {live.get('openAIBaseUrl')}")
+        return
+
+    live = live_read()
+    if "error" in live:
+        die(live["error"])
+    print(f"live  useOpenAIKey: {live['useOpenAIKey']}    ({'ON' if live['useOpenAIKey'] else 'OFF'})")
+    res = live_set(target)
+    if "error" in res:
+        die(res["error"])
+    print(f"      -> {res['after']}    ({'ON' if res['after'] else 'OFF'})   [before={res['before']}]")
+
+
+if __name__ == "__main__":
+    main()

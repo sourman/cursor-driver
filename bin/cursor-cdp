@@ -1,0 +1,161 @@
+#!/usr/bin/env node
+'use strict';
+/*
+ * cursor-cdp — drive the running Cursor instance over the Chrome DevTools
+ * Protocol. Cursor must be launched with --remote-debugging-port=9223
+ * (added in ~/.local/share/applications/cursor.desktop).
+ *
+ *   cursor-cdp targets                 list page targets
+ *   cursor-cdp contexts                list execution contexts (main + isolated worlds)
+ *   cursor-cdp eval '<js expression>'  Runtime.evaluate in a context
+ *   cursor-cdp eval-file <path>        same, expression read from a file
+ *
+ *   --target <substr>                  match a page by id/url (default: 'workbench')
+ *   --context <substr>                 match an execution context by name/auxData.
+ *                                     default: main world. e.g. --context isolated
+ *                                     or --context preload to reach the AMD loader.
+ *   --no-await                         don't awaitPromise
+ *   --raw                              print full CDP result JSON
+ *
+ * Node 22+ globals only (fetch, WebSocket) — no deps.
+ */
+
+const PORT = parseInt(process.env.CURSOR_CDP_PORT || '9223', 10);
+
+function parseArgs(argv) {
+  const out = { cmd: null, rest: [], target: 'workbench', context: null, noAwait: false, raw: false };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--target') { out.target = argv[++i]; }
+    else if (a === '--context') { out.context = argv[++i]; }
+    else if (a === '--no-await') { out.noAwait = true; }
+    else if (a === '--raw') { out.raw = true; }
+    else if (!out.cmd && ['targets', 'contexts', 'eval', 'eval-file'].includes(a)) { out.cmd = a; }
+    else { out.rest.push(a); }
+  }
+  return out;
+}
+
+async function listTargets() {
+  const r = await fetch(`http://127.0.0.1:${PORT}/json/list`);
+  if (!r.ok) throw new Error(`/json/list -> HTTP ${r.status} (is Cursor running with the port?)`);
+  return r.json();
+}
+
+function pickTarget(targets, sub) {
+  const pages = targets.filter((t) => t.type === 'page');
+  const bySub = pages.filter((t) => (t.url || '').includes(sub) || (t.id || '').includes(sub));
+  return bySub[0] || pages[0] || null;
+}
+
+// A tiny CDP session: routes id-matched replies, and captures async events.
+function openSession(url) {
+  const ws = new WebSocket(url);
+  const pending = new Map();
+  const events = [];
+  let nextId = 1;
+  const stopped = new Promise((resolve) => ws.addEventListener('close', resolve));
+
+  ws.addEventListener('message', (ev) => {
+    let data; try { data = JSON.parse(ev.data); } catch (_) { return; }
+    if (data.id && pending.has(data.id)) {
+      const { resolve, reject } = pending.get(data.id); pending.delete(data.id);
+      if (data.error) reject(new Error('CDP error: ' + JSON.stringify(data.error)));
+      else resolve(data.result);
+    } else if (data.method) {
+      events.push(data);
+    }
+  });
+
+  function call(method, params, timeoutMs = 20000) {
+    return new Promise((resolve, reject) => {
+      const id = nextId++;
+      pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => { pending.delete(id); reject(new Error('timeout: ' + method)); }, timeoutMs);
+      const wrap = (fn) => (v) => { clearTimeout(timer); fn(v); };
+      pending.set(id, { resolve: wrap(resolve), reject: wrap(reject) });
+      const payload = JSON.stringify({ id, method, params });
+      if (ws.readyState === 1) ws.send(payload);                 // already open
+      else ws.addEventListener('open', () => ws.send(payload), { once: true });
+    });
+  }
+
+  async function drainEvents(ms = 400) {
+    await new Promise((r) => setTimeout(r, ms));
+    return events.splice(0);
+  }
+  function close() { try { ws.close(); } catch (_) {} }
+  return { call, drainEvents, close, stopped };
+}
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  if (!args.cmd) {
+    console.error('usage: cursor-cdp targets | contexts | eval "<expr>" | eval-file <path> [--target substr] [--context substr] [--no-await] [--raw]');
+    process.exit(2);
+  }
+  const targets = await listTargets();
+
+  if (args.cmd === 'targets') {
+    for (const t of targets) console.log(`${(t.type || '').padEnd(7)} ${t.id}  ${(t.title || '').slice(0, 40)}  <-  ${t.url}`);
+    return;
+  }
+
+  const tgt = pickTarget(targets, args.target);
+  if (!tgt) { console.error(`no page target matched '--target ${args.target}'`); process.exit(1); }
+  console.error(`# target: ${(tgt.title || '(untitled)').slice(0, 50)}  ${tgt.url}`);
+
+  const sess = openSession(tgt.webSocketDebuggerUrl);
+  try {
+    await sess.call('Runtime.enable');
+
+    // collect execution contexts
+    const evs = await sess.drainEvents(500);
+    const ctxs = evs
+      .filter((e) => e.method === 'Runtime.executionContextCreated')
+      .map((e) => e.params.context);
+
+    if (args.cmd === 'contexts') {
+      for (const c of ctxs) {
+        const def = c.auxData && c.auxData.isDefault ? 'DEFAULT' : 'isolated';
+        console.log(`id=${String(c.id).padEnd(6)} ${def.padEnd(8)} name="${c.name || ''}" origin=${c.origin || ''} aux=${JSON.stringify(c.auxData || {})}`);
+      }
+      return;
+    }
+
+    // eval / eval-file
+    const expr = args.cmd === 'eval-file'
+      ? require('fs').readFileSync(args.rest[0], 'utf8')
+      : args.rest.join(' ');
+    if (!expr) { console.error('no expression'); process.exit(2); }
+
+    let contextId;
+    if (args.context) {
+      const sub = args.context.toLowerCase();
+      const match = ctxs.find((c) =>
+        (c.name && c.name.toLowerCase().includes(sub)) ||
+        JSON.stringify(c.auxData || {}).toLowerCase().includes(sub) ||
+        String(c.id) === args.context);
+      if (!match) { console.error(`no execution context matched '--context ${args.context}'`); console.error('available:'); for (const c of ctxs) console.error(`  id=${c.id} name="${c.name}" aux=${JSON.stringify(c.auxData||{})}`); process.exit(1); }
+      contextId = match.id;
+      console.error(`# context: id=${match.id} name="${match.name}"`);
+    }
+
+    const result = await sess.call('Runtime.evaluate', {
+      expression: expr, returnByValue: true, awaitPromise: !args.noAwait, userGesture: true,
+      ...(contextId ? { contextId } : {}),
+    });
+
+    if (args.raw) { console.log(JSON.stringify(result, null, 2)); return; }
+    const res = result && result.result;
+    if (res && res.exceptionDetails) {
+      console.error('JS exception:', JSON.stringify(res.exceptionDetails, null, 2));
+      process.exit(1);
+    }
+    console.log(res && res.value !== undefined ? res.value : res);
+  } finally {
+    sess.close();
+  }
+}
+
+main().catch((e) => { console.error('cursor-cdp:', e.message); process.exit(1); });

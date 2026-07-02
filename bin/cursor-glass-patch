@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# cursor-glass-patch — (re)apply the globalThis.__cursorRS hook to Cursor's
+# Glass UI bundle + clear the v8 bytecode cache, so cursor-openai-toggle can
+# drive the live reactive-storage setter over CDP. Re-run after ANY Cursor
+# upgrade (apt replaces the patched file).
+#
+#   cursor-glass-patch            # patch + clear cache
+#   cursor-glass-patch --restart  # also fully restart Cursor to apply
+#
+# What it does: injects `globalThis.__cursorRS=this,` before the service's
+# `setApplicationUserPersistentStorage` assignment in workbench.glass.main.js,
+# exposing the live reactive-storage service. See memory: cursor-settings-state-toggle.
+set -euo pipefail
+
+GLASS="${CURSOR_GLASS_JS:-/usr/share/cursor/resources/app/out/vs/workbench/workbench.glass.main.js}"
+RESTART=0
+[ "${1:-}" = "--restart" ] && RESTART=1
+
+[ -f "$GLASS" ] || { echo "cursor-glass-patch: Glass bundle not found: $GLASS" >&2; exit 1; }
+
+echo "==> patching $GLASS"
+sudo -n env CURSOR_GLASS_JS="$GLASS" python3 - <<'PY'
+import os, sys
+F = os.environ["CURSOR_GLASS_JS"]
+ORIG = F + ".orig"
+MARK = "globalThis.__cursorRS=this"
+ANCHOR = "this.setApplicationUserPersistentStorage="
+
+data = open(F, encoding="utf-8").read()
+print(f"    size: {len(data):,} bytes")
+if MARK in data:
+    print("    already patched (hook present) — nothing to inject.")
+    sys.exit(0)
+n = data.count(ANCHOR)
+if n != 1:
+    print(f"    ABORT: anchor '{ANCHOR}' found {n}x (expected 1) — Cursor layout "
+          "changed; re-derive the patch (see memory).", file=sys.stderr)
+    sys.exit(1)
+if not os.path.exists(ORIG):
+    open(ORIG, "w", encoding="utf-8").write(data)
+    print(f"    backup -> {ORIG}")
+else:
+    print(f"    backup exists (preserved): {ORIG}")
+new = data.replace(ANCHOR, MARK + "," + ANCHOR, 1)
+tmp = F + ".patching"
+open(tmp, "w", encoding="utf-8").write(new); os.chmod(tmp, 0o644)
+st = os.stat(F); os.chown(tmp, st.st_uid, st.st_gid); os.replace(tmp, F)
+print("    injected globalThis.__cursorRS hook.")
+PY
+
+echo "==> clearing v8 bytecode cache (so the patched source recompiles)"
+rm -rf ~/.config/Cursor/CachedData/* ~/.config/Cursor/Code\ Cache/* 2>/dev/null || true
+echo "    cleared."
+
+if ! grep -q 'remote-debugging-port=9223' ~/.local/share/applications/cursor.desktop 2>/dev/null; then
+  echo "cursor-glass-patch: WARNING — cursor.desktop lacks --remote-debugging-port=9223;" \
+       "live toggle won't work until it's added to the Exec line(s)." >&2
+fi
+
+if [ "$RESTART" -eq 1 ]; then
+  echo "==> restarting Cursor to apply ..."
+  pkill -f /usr/share/cursor/cursor 2>/dev/null || true
+  sleep 1
+  setsid /usr/share/cursor/cursor --disable-background-timer-throttling \
+    --disable-renderer-backgrounding --disable-backgrounding-occluded-windows \
+    --remote-debugging-port=9223 >/tmp/cursor-glass-patch-relaunch.log 2>&1 </dev/null &
+  disown
+  echo "    relaunched (log: /tmp/cursor-glass-patch-relaunch.log). Wait ~8s, then: cursor-openai-toggle --status"
+else
+  cat <<EOF
+
+Done. Fully quit + reopen Cursor so the patched bundle loads (the
+"installation appears corrupt" notice is expected — dismiss it). Then verify:
+    cursor-openai-toggle --status
+EOF
+fi
