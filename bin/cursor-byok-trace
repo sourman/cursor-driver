@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""
+cursor-byok-trace — inspect how Cursor's BYOK (bring-your-own-key) routing
+resolves for each model, and (optionally) watch the renderer for requests that
+get misrouted to your custom OpenAI endpoint.
+
+This is the diagnostic companion to cursor-openai-toggle. The toggle flips the
+global `useOpenAIKey` flag; this tool shows the *consequence* of that flag on
+every model — because Cursor's per-model routing function (`fHy` in
+workbench.glass.main.js) has a default branch that force-routes any non-Claude,
+non-Gemini model (including Cursor's OWN composer-2.5 → grok-composer-2.5) to
+the custom endpoint whenever `useOpenAIKey` is set. See
+docs/composer-byok-bug-report.md for the full write-up.
+
+No bundle patch of its own — reuses the globalThis.__cursorRS hook installed by
+cursor-glass-patch. Cursor must be running with --remote-debugging-port=9223.
+
+  cursor-byok-trace                 # dump live flags + per-model routing table
+  cursor-byok-trace --watch [secs]  # hook renderer fetch/WS, log traffic to the
+                                    #   custom endpoint (or /chat/completions) for
+                                    #   N seconds (default 30). Reproduce the bug
+                                    #   in Cursor while it runs.
+  cursor-byok-trace --watch --clear # remove previously installed hooks
+
+NOTE on --watch scope: the actual composer streaming request rides a protobuf
+aiserver.v1.* message over IPC to Cursor's MAIN process, which is outside the
+renderer's network stack — so a renderer hook sees the BYOK model-list probe
+(POST {openAIBaseUrl}/chat/completions) and any renderer-issued calls, but not
+the main-process hop. The routing decision itself is made renderer-side, which
+is what --watch's fetch hits demonstrate; for the main-process call, the code +
+live-state evidence in the bug report is conclusive.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+CDP = os.path.expanduser("~/.local/bin/cursor-cdp")
+GLASS = os.environ.get(
+    "CURSOR_GLASS_JS",
+    "/usr/share/cursor/resources/app/out/vs/workbench/workbench.glass.main.js",
+)
+# The two forms of fHy's default branch (see bin/cursor-byok-fix).
+_FHY_ORIGINAL = 'e.useOpenAIKey?"openai":void 0'
+_FHY_FIXED = 'e.useOpenAIKey&&!/^(composer-|grok-)/.test(n)?"openai":void 0'
+
+
+def byok_patch_applied():
+    """True if cursor-byok-fix has patched fHy in the Glass bundle."""
+    try:
+        with open(GLASS, encoding="utf-8", errors="ignore") as f:
+            return _FHY_FIXED in f.read()
+    except OSError:
+        return False
+
+
+# Mirror of Cursor's SJk/kJk/fHy (workbench.glass.main.js ~L12006). Kept inline
+# so the trace is self-contained and survives bundle renames.
+INSPECT_JS = r"""
+(() => {
+  const rs = globalThis.__cursorRS;
+  // cursor-cdp prints via Node's console (util.inspect, NOT JSON), so we always
+  // JSON.stringify the result for the Python side to json.loads back into a dict.
+  if (!rs) return JSON.stringify({ error: "__cursorRS not present — run `cursor-glass-patch` then restart Cursor" });
+  const s = rs.applicationUserPersistentStorage || {};
+  const PATCHED = __PATCHED__;   // true if cursor-byok-fix patched fHy in the bundle
+  const live = globalThis.__cursorAiSettings;   // live model-key service (cursor-glass-patch); may be undefined
+  const isClaude = m => typeof m === "string" && m.startsWith("claude-");
+  const isGemini = m => typeof m === "string" && m.startsWith("gemini-");
+  const isCursorOwn = m => /^(composer-|grok-)/.test(m);
+  // Mirror of Cursor's fHy — FALLBACK ONLY when the live service isn't exposed.
+  // When PATCHED, the default branch skips Cursor-own models.
+  const mirrorFHy = (n, e) => isClaude(n) ? (e.useClaudeKey ? "anthropic" : undefined)
+                    : isGemini(n) ? (e.useGoogleKey ? "google" : undefined)
+                    : (e.useOpenAIKey && !(PATCHED && isCursorOwn(n))) ? "openai" : undefined;
+  const kindOf = m => {
+    if (isCursorOwn(m)) return "cursor-own";                       // Cursor proprietary
+    if (isClaude(m)) return "claude";
+    if (isGemini(m)) return "google";
+    if (/^(gpt-|o\d|text-|chatgpt)/.test(m)) return "openai";      // Cursor-proxied OpenAI family
+    return "custom";                                               // e.g. glm-5.2 — user's endpoint
+  };
+  const useLive = !!(live && typeof live.getUseApiKeyForModel === "function");
+  // availableAPIKeyModels = what the custom endpoint advertises (may be empty if
+  // the /models probe didn't run). Used only to shade the OpenAI-family rows.
+  const avail = s.availableAPIKeyModels;
+  const served = new Set(Array.isArray(avail) ? avail : (avail ? Object.keys(avail) : []));
+  const models = [
+    "composer-2.5", "composer-2.5-fast", "composer-2", "gpt-4o", "gpt-4.1",
+    "gpt-5", "o3", "o4-mini", "claude-sonnet-4", "claude-opus-4.1",
+    "gemini-2.5-pro", "gemini-2.5-flash", "grok-composer-2.5", "glm-5.2",
+  ];
+  const rows = models.map(m => {
+    const kind = kindOf(m);
+    // routed = "would Cursor attach a custom key for this model?" Prefer the
+    // LIVE function (authoritative — reflects the real loaded fHy, patched or
+    // not, so it can never drift from Cursor's actual behavior); fall back to
+    // the mirror and label it "predicted".
+    let routed, provider, source;
+    if (useLive) {
+      routed = !!live.getUseApiKeyForModel(m);
+      provider = routed ? "custom-key" : null;
+      source = "live";
+    } else {
+      const via = mirrorFHy(m, s);
+      routed = via !== undefined;
+      provider = via || null;
+      source = "predicted";
+    }
+    let poisoned = false, why = "";
+    if (routed) {
+      if (kind === "cursor-own") { poisoned = true; why = "Cursor model — backend rejects custom key (THE BUG)"; }
+      else if (kind === "openai") {
+        poisoned = !served.has(m);
+        why = served.has(m) ? "your endpoint serves it — OK" : "your endpoint likely doesn't serve it";
+      } else { why = "your custom model — routed to your endpoint (correct)"; }
+    }
+    return {
+      model: m, kind, source,
+      routedVia: routed ? (provider || "custom-key") : "(cursor backend)",
+      poisoned, why,
+    };
+  });
+  const payload = {
+    patched: PATCHED,
+    mode: useLive ? "live" : "predicted",   // live = Cursor's real routing fn; predicted = fHy mirror fallback
+    flags: {
+      useOpenAIKey: !!s.useOpenAIKey,
+      useClaudeKey: !!s.useClaudeKey,
+      useGoogleKey: !!s.useGoogleKey,
+      openAIBaseUrl: s.openAIBaseUrl ?? null,
+      openAIKeyPresent: !!s.openAIKey,
+    },
+    availableAPIKeyModels: s.availableAPIKeyModels ?? null,
+    rows,
+  };
+  return JSON.stringify(payload);
+})()
+"""
+
+INSTALL_HOOK_JS = r"""
+(() => {
+  const rs = globalThis.__cursorRS;
+  const endpoint = (rs && rs.applicationUserPersistentStorage && rs.applicationUserPersistentStorage.openAIBaseUrl) || "";
+  const log = globalThis.__byokLog || (globalThis.__byokLog = []);
+  if (globalThis.__byokHooked) return JSON.stringify({ status: "already-installed", endpoint, entries: log.length });
+  globalThis.__byokHooked = true;
+  const push = (e) => log.push(Object.assign({ t: Math.round(performance.now()) }, e));
+  const interesting = (url) => {
+    const u = (url || "").toString();
+    if (endpoint && u.includes(endpoint)) return true;
+    return /\/(chat\/completions|v1\/models|completions|responses)\b/.test(u);
+  };
+  const tryModel = (body) => { try { return JSON.parse(body).model; } catch (_) { return undefined; } };
+
+  const ofetch = globalThis.fetch;
+  globalThis.fetch = function (input, init) {
+    try {
+      const url = typeof input === "string" ? input : (input && input.url) || "";
+      const body = init && init.body;
+      if (interesting(url)) push({ kind: "fetch", method: (init && init.method) || "GET", url, model: tryModel(body) });
+    } catch (_) {}
+    return ofetch.apply(this, arguments);
+  };
+  // Capture WS frames too (Cursor streams over WS to its aiserver in some flows).
+  if (globalThis.WebSocket) {
+    const osend = WebSocket.prototype.send;
+    WebSocket.prototype.send = function (data) {
+      try {
+        const s = typeof data === "string" ? data : "";
+        if (/grok-composer|composer-2|"model"|chat\/completions/i.test(s) || (endpoint && s.includes(endpoint)))
+          push({ kind: "ws-send", url: this.url, snippet: s.slice(0, 300) });
+      } catch (_) {}
+      return osend.apply(this, arguments);
+    };
+  }
+  return JSON.stringify({ status: "installed", endpoint, entries: 0 });
+})()
+"""
+
+READ_HOOK_JS = r"""JSON.stringify(globalThis.__byokLog || [])"""
+CLEAR_HOOK_JS = r"""(()=>{const n=globalThis.__byokLog||[];globalThis.__byokHooked=false;globalThis.__byokLog=[];return JSON.stringify({cleared:n.length})})()"""
+
+
+def cdp_eval(js, timeout=30):
+    js = js.replace("__PATCHED__", "true" if byok_patch_applied() else "false")
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+        f.write(js)
+        path = f.name
+    try:
+        r = subprocess.run([CDP, "eval-file", path], capture_output=True, text=True, timeout=timeout)
+    finally:
+        os.unlink(path)
+    if r.returncode != 0:
+        sys.stderr.write(
+            "cursor-byok-trace: CDP call failed (is Cursor running with "
+            "--remote-debugging-port=9223 and the patch applied?)\n  "
+            + (r.stderr.strip() or r.stdout.strip()) + "\n"
+        )
+        sys.exit(1)
+    out = r.stdout.strip().splitlines()
+    val = out[-1] if out else ""
+    try:
+        return json.loads(val)
+    except json.JSONDecodeError:
+        return val
+
+
+def cmd_dump():
+    data = cdp_eval(INSPECT_JS)
+    if isinstance(data, dict) and data.get("error"):
+        print(data["error"], file=sys.stderr); sys.exit(1)
+    f = data["flags"]
+    if data.get("mode") == "live":
+        print("[authoritative] querying Cursor's REAL getUseApiKeyForModel() via __cursorAiSettings")
+    else:
+        print("[PREDICTED] live hook not loaded — re-run `cursor-glass-patch` + restart Cursor to")
+        print("            expose __cursorAiSettings, then this becomes authoritative (no mirror drift).")
+    if data.get("patched"):
+        print("  *** cursor-byok-fix PATCHED — fHy skips composer-*/grok-* (workaround active) ***")
+    print("BYOK flags (live):")
+    print(f"  useOpenAIKey  : {f['useOpenAIKey']}")
+    print(f"  useClaudeKey  : {f['useClaudeKey']}")
+    print(f"  useGoogleKey  : {f['useGoogleKey']}")
+    print(f"  openAIBaseUrl : {f['openAIBaseUrl']}")
+    print(f"  openAIKey set : {f['openAIKeyPresent']}")
+    avail = data.get("availableAPIKeyModels")
+    if isinstance(avail, dict):
+        avail = list(avail.keys()) if avail else []
+    print(f"  availableAPIKeyModels (what your endpoint serves): {avail}")
+    print()
+    print("Per-model routing  (fHy default branch = the bug):")
+    print(f"  {'model':<20}{'kind':<13}{'routedVia':<16}status")
+    print(f"  {'-'*20}{'-'*13}{'-'*16}------")
+    for r in data["rows"]:
+        if r["poisoned"]:
+            status = "BROKEN  " + r["why"]
+        elif r["routedVia"] == "openai":
+            status = "ok      " + r["why"]
+        else:
+            status = "ok      (cursor backend)"
+        print(f"  {r['model']:<20}{r['kind']:<13}{r['routedVia']:<16}{status}")
+    broken = [r["model"] for r in data["rows"] if r["poisoned"]]
+    print()
+    if broken:
+        print(f"!! {len(broken)} model(s) break with useOpenAIKey on: {', '.join(broken)}")
+        print(f"   They are force-routed toward {f['openAIBaseUrl']} (or get a custom key attached),")
+        print("   so Cursor-served models among them fail. Your own endpoint's models are unaffected.")
+    else:
+        print("OK — no Cursor-served models are being misrouted.")
+
+
+def cmd_watch(secs, clear):
+    if clear:
+        print(cdp_eval(CLEAR_HOOK_JS)); return
+    res = cdp_eval(INSTALL_HOOK_JS)
+    print(f"# hook {res['status']}  endpoint={res.get('endpoint')}")
+    print(f"# watching renderer fetch/WS for {secs}s — REPRODUCE IN CURSOR NOW "
+          "(select composer-2.5 + send a message, or toggle BYOK).")
+    deadline = time.time() + secs
+    seen = 0
+    try:
+        while time.time() < deadline:
+            time.sleep(2)
+            entries = cdp_eval(READ_HOOK_JS) or []
+            for e in entries[seen:]:
+                seen += 1
+                if e.get("kind") == "fetch":
+                    print(f"  +{e['t']}ms FETCH {e.get('method','')} {e.get('url','')}  model={e.get('model')}")
+                else:
+                    print(f"  +{e['t']}ms {e.get('kind','')} {e.get('url','')}\n        {e.get('snippet','')}")
+    except KeyboardInterrupt:
+        pass
+    print(f"# done. {seen} matching event(s).")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Inspect Cursor BYOK model routing.")
+    ap.add_argument("--watch", nargs="?", const=30, type=int, default=None,
+                    help="hook renderer and log custom-endpoint / chat traffic for N seconds")
+    ap.add_argument("--clear", action="store_true", help="remove previously installed --watch hooks")
+    args = ap.parse_args()
+    if args.watch is not None:
+        cmd_watch(args.watch, args.clear)
+    else:
+        cmd_dump()
+
+
+if __name__ == "__main__":
+    main()

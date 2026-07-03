@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# cursor-byok-fix — LOCAL WORKAROUND for the "BYOK poisons Cursor's own models"
+# bug (see docs/composer-byok-bug-report.md). Lets you use Composer 2.5 / grok
+# (Cursor's backend) AND your own custom-endpoint models (e.g. glm-5.2) AT THE
+# SAME TIME, with "use my own OpenAI key" left ON globally — no toggling.
+#
+# It patches the routing function fHy in workbench.glass.main.js so that
+# Cursor-proprietary models (composer-* / grok-*) are never routed through the
+# custom OpenAI key. Everything else (your custom models, real OpenAI models,
+# claude-*/gemini-*) behaves exactly as before.
+#
+#   cursor-byok-fix            # apply patch + clear v8 cache
+#   cursor-byok-fix --restart  # ...and fully relaunch Cursor to apply
+#   cursor-byok-fix --status   # show patch state, change nothing
+#   cursor-byok-fix --revert   # remove ONLY this patch (keeps __cursorRS)
+#
+# Companion to cursor-glass-patch — same bundle file, different anchor, so both
+# coexist. Re-run after ANY Cursor upgrade (apt replaces the patched file).
+# The "installation appears corrupt" notice is expected while patched.
+set -euo pipefail
+
+GLASS="${CURSOR_GLASS_JS:-/usr/share/cursor/resources/app/out/vs/workbench/workbench.glass.main.js}"
+MODE="patch"
+case "${1:-}" in
+  --restart) MODE=patch; RESTART=1;;
+  --status)  MODE=status; RESTART=0;;
+  --revert)  MODE=revert; RESTART=0;;
+  "")        MODE=patch; RESTART=0;;
+  *) echo "usage: cursor-byok-fix [--restart|--status|--revert]" >&2; exit 2;;
+esac
+[ "${RESTART:-0}" = "1" ] || RESTART=0
+
+[ -f "$GLASS" ] || { echo "cursor-byok-fix: Glass bundle not found: $GLASS" >&2; exit 1; }
+
+sudo -n env CURSOR_GLASS_JS="$GLASS" MODE="$MODE" python3 - <<'PY'
+import os, sys
+F = os.environ["CURSOR_GLASS_JS"]
+MODE = os.environ["MODE"]
+# The fHy default branch — the exact bytes Cursor ships.
+ORIGINAL = 'e.useOpenAIKey?"openai":void 0'
+# Patched: route via the custom key only for non-Cursor-own models. `n` is fHy's
+# model-name parameter, so composer-*/grok-* fall through to undefined (= Cursor
+# backend, no custom key) even when useOpenAIKey is globally on.
+FIXED = 'e.useOpenAIKey&&!/^(composer-|grok-)/.test(n)?"openai":void 0'
+
+data = open(F, encoding="utf-8").read()
+print(f"    size: {len(data):,} bytes")
+has_fixed = FIXED in data
+orig_count = data.count(ORIGINAL)
+
+if MODE == "status":
+    if has_fixed:
+        print("    state: PATCHED (fHy skips composer-*/grok-* for the custom key).")
+    elif orig_count >= 1:
+        print("    state: UNPATCHED (fHy routes all default-category models via the custom key).")
+    else:
+        print("    state: UNKNOWN — anchor not found; Cursor bundle layout changed, re-derive.", file=sys.stderr)
+        sys.exit(1)
+    sys.exit(0)
+
+if MODE == "patch":
+    if has_fixed:
+        print("    already patched — nothing to do."); sys.exit(0)
+    if orig_count != 1:
+        print(f"    ABORT: anchor found {orig_count}x (expected 1) — Cursor's bundle layout "
+              "changed; re-derive the patch (see docs/composer-byok-bug-report.md).", file=sys.stderr)
+        sys.exit(1)
+    new = data.replace(ORIGINAL, FIXED, 1)
+elif MODE == "revert":
+    if not has_fixed:
+        print("    not patched — nothing to revert."); sys.exit(0)
+    # Restore ONLY this patch: keep the __cursorRS hook (different anchor) intact.
+    if data.count(FIXED) != 1:
+        print("    ABORT: patched anchor not unique; not auto-reverting.", file=sys.stderr); sys.exit(1)
+    new = data.replace(FIXED, ORIGINAL, 1)
+else:
+    sys.exit(2)
+
+ORIG = F + ".orig"
+if not os.path.exists(ORIG):
+    open(ORIG, "w", encoding="utf-8").write(data)   # pristine; shared w/ cursor-glass-patch
+    print(f"    backup -> {ORIG}")
+else:
+    print(f"    backup exists (preserved): {ORIG}")
+tmp = F + ".patching"
+open(tmp, "w", encoding="utf-8").write(new); os.chmod(tmp, 0o644)
+st = os.stat(F); os.chown(tmp, st.st_uid, st.st_gid); os.replace(tmp, F)
+print(f"    {MODE} applied.")
+PY
+
+if [ "$MODE" = "status" ]; then exit 0; fi
+
+echo "==> clearing v8 bytecode cache (so the patched source recompiles)"
+rm -rf ~/.config/Cursor/CachedData/* ~/.config/Cursor/Code\ Cache/* 2>/dev/null || true
+echo "    cleared."
+
+if [ "$RESTART" -eq 1 ]; then
+  echo "==> restarting Cursor to apply ..."
+  pkill -f /usr/share/cursor/cursor 2>/dev/null || true
+  sleep 1
+  setsid /usr/share/cursor/cursor --disable-background-timer-throttling \
+    --disable-renderer-backgrounding --disable-backgrounding-occluded-windows \
+    --remote-debugging-port=9223 >/tmp/cursor-byok-fix-relaunch.log 2>&1 </dev/null &
+  disown
+  echo "    relaunched (log: /tmp/cursor-byok-fix-relaunch.log). Wait ~8s, then:"
+  echo "      cursor-byok-trace      # composer-2.5 should now route to the cursor backend"
+else
+  cat <<EOF
+
+Done. Fully quit + reopen Cursor so the patched bundle loads (the
+"installation appears corrupt" notice is expected — dismiss it). Then verify:
+    cursor-byok-fix --status
+    cursor-byok-trace          # composer-2.5 should now show (cursor backend), not openai
+With BYOK still ON, Composer 2.5 and your custom models should both work.
+EOF
+fi
