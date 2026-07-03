@@ -9,7 +9,10 @@
 #
 # What it does: injects `globalThis.__cursorRS=this,` before the service's
 # `setApplicationUserPersistentStorage` assignment in workbench.glass.main.js,
-# exposing the live reactive-storage service. See memory: cursor-settings-state-toggle.
+# exposing the live reactive-storage service; AND injects
+# `globalThis.__cursorAiSettings=this,` at the AI-settings service constructor,
+# exposing the live model-key service (used by cursor-byok-trace to call Cursor's
+# real getUseApiKeyForModel instead of a hardcoded mirror). See CLAUDE.md.
 set -euo pipefail
 
 GLASS="${CURSOR_GLASS_JS:-/usr/share/cursor/resources/app/out/vs/workbench/workbench.glass.main.js}"
@@ -23,29 +26,53 @@ sudo -n env CURSOR_GLASS_JS="$GLASS" python3 - <<'PY'
 import os, sys
 F = os.environ["CURSOR_GLASS_JS"]
 ORIG = F + ".orig"
-MARK = "globalThis.__cursorRS=this"
-ANCHOR = "this.setApplicationUserPersistentStorage="
 
-data = open(F, encoding="utf-8").read()
+# Hooks to inject: (global_marker, unique_constructor_anchor). Each exposes an
+# internal service so CDP tooling can drive/inspect it. Idempotent per hook;
+# aborts (without writing) if an anchor isn't exactly once — Cursor's bundle
+# layout shifted and the patch must be re-derived.
+HOOKS = [
+    # The reactive-storage service — used by cursor-openai-toggle to flip flags.
+    ("globalThis.__cursorRS=this",
+     "this.setApplicationUserPersistentStorage="),
+    # The AI-settings (model-key) service — used by cursor-byok-trace to call
+    # Cursor's REAL getUseApiKeyForModel(), so the tool reports live routing
+    # instead of a hardcoded mirror.
+    ("globalThis.__cursorAiSettings=this",
+     'this.storageId="aisettings.service"'),
+]
+
+pristine = open(F, encoding="utf-8").read()   # on-disk content BEFORE mutation
+data = pristine
 print(f"    size: {len(data):,} bytes")
-if MARK in data:
-    print("    already patched (hook present) — nothing to inject.")
+changed = False
+for mark, anchor in HOOKS:
+    if mark in data:
+        print(f"    present:   {mark}")
+        continue
+    n = data.count(anchor)
+    if n != 1:
+        print(f"    ABORT: anchor '{anchor}' found {n}x (expected 1) — Cursor layout "
+              "changed; re-derive the patch (see CLAUDE.md).", file=sys.stderr)
+        sys.exit(1)
+    data = data.replace(anchor, mark + "," + anchor, 1)
+    changed = True
+    print(f"    injected:  {mark}")
+
+if not changed:
+    print("    all hooks already present — nothing to inject.")
     sys.exit(0)
-n = data.count(ANCHOR)
-if n != 1:
-    print(f"    ABORT: anchor '{ANCHOR}' found {n}x (expected 1) — Cursor layout "
-          "changed; re-derive the patch (see memory).", file=sys.stderr)
-    sys.exit(1)
+
+# Back up the pristine (pre-hook) file once; preserve across runs/upgrades.
 if not os.path.exists(ORIG):
-    open(ORIG, "w", encoding="utf-8").write(data)
+    open(ORIG, "w", encoding="utf-8").write(pristine)
     print(f"    backup -> {ORIG}")
 else:
     print(f"    backup exists (preserved): {ORIG}")
-new = data.replace(ANCHOR, MARK + "," + ANCHOR, 1)
 tmp = F + ".patching"
-open(tmp, "w", encoding="utf-8").write(new); os.chmod(tmp, 0o644)
+open(tmp, "w", encoding="utf-8").write(data); os.chmod(tmp, 0o644)
 st = os.stat(F); os.chown(tmp, st.st_uid, st.st_gid); os.replace(tmp, F)
-print("    injected globalThis.__cursorRS hook.")
+print("    done.")
 PY
 
 echo "==> clearing v8 bytecode cache (so the patched source recompiles)"
