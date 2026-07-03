@@ -121,7 +121,7 @@ routed `"openai"`; and the user's *own* custom model (`glm-5.2`) routes to the
 endpoint correctly — so the failure is specific to Cursor-served models caught by
 the default branch, not to BYOK overall.
 
-## Network capture (definitive)
+## Network capture
 
 tshark TLS-SNI capture on the Cursor host during a live repro (BYOK on, Composer
 2.5 selected, message sent → error "This model does not support custom API keys",
@@ -150,8 +150,6 @@ entire failure is client-side misclassification (`fHy`) → server-side enforcem
    an explicit per-model toggle rather than collapsing to the global flag for the
    entire default category.
 
-Option 1 is the smallest, most targeted change and cannot regress real BYOK
-models (gpt-*/o3), which remain in the default branch.
 
 ### Verified locally
 
