@@ -43,9 +43,13 @@ GLASS = os.environ.get(
     "CURSOR_GLASS_JS",
     "/usr/share/cursor/resources/app/out/vs/workbench/workbench.glass.main.js",
 )
-# The two forms of fHy's default branch (see bin/cursor-byok-fix).
+# The two forms of the routing fn's default branch (see bin/cursor-byok-fix).
+# Both literals must stay byte-identical to the strings in cursor-byok-fix — this
+# is how byok_patch_applied() detects that the fix is active, so a mismatch makes
+# the trace silently misreport "not patched". Minified names are version-specific
+# (3.10.11: `dim(t,e)`, model param `t`; 3.9.16: `fHy(n,e)`, param `n`).
 _FHY_ORIGINAL = 'e.useOpenAIKey?"openai":void 0'
-_FHY_FIXED = 'e.useOpenAIKey&&!/^(composer-|grok-)/.test(n)?"openai":void 0'
+_FHY_FIXED = 'e.useOpenAIKey&&!/^(composer-|grok-)/.test(t)?"openai":void 0'
 
 
 def byok_patch_applied():

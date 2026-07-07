@@ -36,12 +36,17 @@ sudo -n env CURSOR_GLASS_JS="$GLASS" MODE="$MODE" python3 - <<'PY'
 import os, sys
 F = os.environ["CURSOR_GLASS_JS"]
 MODE = os.environ["MODE"]
-# The fHy default branch — the exact bytes Cursor ships.
+# The routing fn's default branch — the exact bytes Cursor ships. Both minified
+# names here are VERSION-SPECIFIC: in 3.10.11 the fn is `dim(t,e)` (e=storage,
+# t=model name); in 3.9.16 it was `fHy(n,e)`. If the ORIGINAL anchor count below
+# isn't 1, or the model param renames, Cursor bumped — re-derive (see
+# docs/composer-byok-bug-report.md). Keep this FIXED string in lockstep with
+# _FHY_FIXED in bin/cursor-byok-trace (patch-detection must match the applied bytes).
 ORIGINAL = 'e.useOpenAIKey?"openai":void 0'
-# Patched: route via the custom key only for non-Cursor-own models. `n` is fHy's
-# model-name parameter, so composer-*/grok-* fall through to undefined (= Cursor
-# backend, no custom key) even when useOpenAIKey is globally on.
-FIXED = 'e.useOpenAIKey&&!/^(composer-|grok-)/.test(n)?"openai":void 0'
+# Patched: route via the custom key only for non-Cursor-own models. `t` is the
+# routing fn's model-name param, so composer-*/grok-* fall through to undefined
+# (= Cursor backend, no custom key) even when useOpenAIKey is globally on.
+FIXED = 'e.useOpenAIKey&&!/^(composer-|grok-)/.test(t)?"openai":void 0'
 
 data = open(F, encoding="utf-8").read()
 print(f"    size: {len(data):,} bytes")
